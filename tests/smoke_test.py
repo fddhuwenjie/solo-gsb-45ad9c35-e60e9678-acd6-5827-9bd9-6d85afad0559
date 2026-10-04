@@ -14,6 +14,12 @@ missing/non-10000 rules, remainder/operator-id cent allocation, immutable
 per-trip ledger, adjustment batches referencing the root that append only
 signed target-minus-cumulative deltas, full reversal of vanished trips,
 idempotent replay/409 conflict, frozen-result query, append-only triggers),
+the clearing payout endpoints (single-transaction per-chain settlement of the
+ledger rows after the last paid seq up to expected_seq, exact per-operator
+manifest match, whole-batch 404/409/422 rejection on unknown chains, stale
+seqs, already-covered ranges and manifest mismatches, immutable payout
+snapshot with live top-up/clawback balances, idempotent replay/409 conflict,
+append-only triggers),
 the tap-event quality scan endpoints (half-open event window, duplicate
 same-type taps, minimum-travel out->in conflicts, evidence chains,
 idempotency/409 conflict, GET query, isolated append-only tables with no
@@ -1162,6 +1168,239 @@ def run(client):
             "SELECT COUNT(*) FROM clearing_batches").fetchone()[0]
     check("five clearing batches persisted (initial + four adjustments)",
           n_clearing_batches == 5)
+
+    # --- Clearing payout batches ------------------------------------------------
+    # 2026-10-12, dedicated passenger PO: two in-window trips, 500 and 400.
+    #   po1:po2  S01 -> S04, 08:00->08:30, 500
+    #   po3:po4  S05 -> S02, 09:00->09:30, transfer 400
+    # 2026-10-13, passenger PQ: one trip pq1:pq2 S01 -> S04, 500.
+    def popost(eid, st, tap, ts, passenger="PO"):
+        rr = client.post("/events", json={
+            "event_id": eid, "passenger_id": passenger,
+            "station_id": st, "tap_type": tap, "occurred_at": ts,
+        })
+        assert rr.status_code == 200, rr.text
+
+    popost("po1", "S01", "in", "2026-10-12T08:00:00Z")
+    popost("po2", "S04", "out", "2026-10-12T08:30:00Z")
+    popost("po3", "S05", "in", "2026-10-12T09:00:00Z")
+    popost("po4", "S02", "out", "2026-10-12T09:30:00Z")
+    popost("pq1", "S01", "in", "2026-10-13T08:00:00Z", passenger="PQ")
+    popost("pq2", "S04", "out", "2026-10-13T08:30:00Z", passenger="PQ")
+
+    r = client.post("/clearings", json={
+        "clearing_id": "clr-pay-a",
+        "window_start": "2026-10-12T00:00:00Z",
+        "window_end": "2026-10-13T00:00:00Z",
+        "rules": clearing_rules,
+    })
+    check("payout fixture first closing created", r.status_code == 200, r.text)
+    pa_totals = {o["operator_id"]: o["amount_cents"]
+                 for o in r.json()["operator_totals"]}
+    check("payout fixture chain totals",
+          pa_totals == {"OA": 327, "OB": 166, "OC": 167, "OD": 160, "OE": 80},
+          pa_totals)
+    r = client.post("/clearings", json={
+        "clearing_id": "clr-pay-c",
+        "window_start": "2026-10-13T00:00:00Z",
+        "window_end": "2026-10-14T00:00:00Z",
+        "rules": clearing_rules,
+    })
+    check("second payout chain first closing created", r.status_code == 200, r.text)
+    pc_totals = {o["operator_id"]: o["amount_cents"]
+                 for o in r.json()["operator_totals"]}
+    check("second chain totals", pc_totals == {"OA": 167, "OB": 166, "OC": 167},
+          pc_totals)
+
+    def payout_body(pid, ref, chains):
+        return {"payout_id": pid, "external_ref": ref, "chains": chains}
+
+    def pay_chain(cid, seq, ops):
+        return {"clearing_id": cid, "expected_seq": seq,
+                "operators": [{"operator_id": o, "amount_cents": a}
+                              for o, a in ops]}
+
+    # Whole-batch rejections: nothing is persisted on any failure.
+    r = client.post("/clearings/payouts", json=payout_body(
+        "pay-bad-chain", "ref-x", [pay_chain("no-such-chain", 0, [])]))
+    check("payout with unknown chain -> 404", r.status_code == 404)
+    r = client.post("/clearings/payouts", json=payout_body(
+        "pay-bad-kind", "ref-x", [pay_chain("clr-2026-10-10-b", 1, [])]))
+    check("payout referencing an adjustment batch -> 422", r.status_code == 422)
+    r = client.post("/clearings/payouts", json=payout_body(
+        "pay-bad-dup", "ref-x",
+        [pay_chain("clr-pay-a", 0, []), pay_chain("clr-pay-a", 0, [])]))
+    check("payout with a duplicate chain -> 422", r.status_code == 422)
+    r = client.post("/clearings/payouts", json=payout_body(
+        "pay-bad-dupop", "ref-x",
+        [pay_chain("clr-pay-a", 0, [("OA", 327), ("OA", 327)])]))
+    check("payout with a duplicate manifest operator -> 422", r.status_code == 422)
+    r = client.post("/clearings/payouts", json=payout_body(
+        "pay-bad-stale", "ref-x", [pay_chain("clr-pay-a", 5, [])]))
+    check("payout with a stale expected_seq -> 409",
+          r.status_code == 409 and "latest batch is seq 0" in r.text)
+    r = client.post("/clearings/payouts", json=payout_body(
+        "pay-bad-amount", "ref-x",
+        [pay_chain("clr-pay-a", 0, [("OA", 328), ("OB", 166), ("OC", 167),
+                                    ("OD", 160), ("OE", 80)])]))
+    check("payout manifest amount mismatch -> 409",
+          r.status_code == 409 and "OA: manifest 328 != computed 327" in r.text)
+    r = client.post("/clearings/payouts", json=payout_body(
+        "pay-bad-missing", "ref-x",
+        [pay_chain("clr-pay-a", 0, [("OA", 327), ("OB", 166), ("OC", 167),
+                                    ("OD", 160)])]))
+    check("payout manifest missing an operator -> 409",
+          r.status_code == 409 and "OE: manifest absent != computed 80" in r.text)
+    r = client.post("/clearings/payouts", json=payout_body(
+        "pay-bad-extra", "ref-x",
+        [pay_chain("clr-pay-a", 0, [("OA", 327), ("OB", 166), ("OC", 167),
+                                    ("OD", 160), ("OE", 80), ("OZ", 0)])]))
+    check("payout manifest with an extra operator -> 409",
+          r.status_code == 409 and "OZ: manifest 0 != computed absent" in r.text)
+    check("rejected payouts leave no row",
+          client.get("/clearings/payouts/pay-bad-amount").status_code == 404
+          and client.get("/clearings/payouts/pay-bad-stale").status_code == 404)
+
+    # Multi-chain payout, submitted with reversed chain/operator array order:
+    # canonicalisation makes the arrays' order irrelevant.
+    pay_multi = payout_body("pay-2026-10-13-m", "bank-20261013-001", [
+        pay_chain("clr-pay-c", 0, [("OC", 167), ("OB", 166), ("OA", 167)]),
+        pay_chain("clr-pay-a", 0, [("OE", 80), ("OD", 160), ("OC", 167),
+                                   ("OB", 166), ("OA", 327)]),
+    ])
+    r = client.post("/clearings/payouts", json=pay_multi)
+    check("multi-chain payout created", r.status_code == 200, r.text)
+    pm = r.json()
+    check("payout chains returned in canonical order with the grand total",
+          pm["status"] == "created" and pm["chain_count"] == 2
+          and [c["clearing_id"] for c in pm["chains"]] == ["clr-pay-a", "clr-pay-c"]
+          and pm["total_amount_cents"] == 1400
+          and pm["external_ref"] == "bank-20261013-001")
+    pm_a = pm["chains"][0]
+    check("first-time payout covers (from_seq=-1, to_seq=0]",
+          pm_a["from_seq"] == -1 and pm_a["to_seq"] == 0
+          and pm_a["entry_count"] == 6 and pm_a["amount_cents"] == 900)
+    check("payout operators frozen in sorted order",
+          [(o["operator_id"], o["amount_cents"]) for o in pm_a["operators"]]
+          == [("OA", 327), ("OB", 166), ("OC", 167), ("OD", 160), ("OE", 80)])
+    check("fresh payout balances are all settled",
+          all(b["direction"] == "none" and b["difference_cents"] == 0
+              and b["paid_cents"] == b["current_cents"]
+              for c in pm["chains"] for b in c["balances"]))
+
+    # Idempotency: identical payload (any array order) replays; different 409.
+    r = client.post("/clearings/payouts", json=payout_body(
+        "pay-2026-10-13-m", "bank-20261013-001", [
+            pay_chain("clr-pay-a", 0, [("OA", 327), ("OB", 166), ("OC", 167),
+                                       ("OD", 160), ("OE", 80)]),
+            pay_chain("clr-pay-c", 0, [("OA", 167), ("OB", 166), ("OC", 167)]),
+        ]))
+    check("same payout payload replays as duplicate",
+          r.json()["status"] == "duplicate" and r.json()["chains"] == pm["chains"])
+    r = client.post("/clearings/payouts", json=dict(
+        pay_multi, external_ref="bank-20261013-002"))
+    check("same payout_id different payload -> 409", r.status_code == 409)
+
+    # The just-paid range cannot be paid again.
+    r = client.post("/clearings/payouts", json=payout_body(
+        "pay-2026-10-13-again", "bank-20261013-003",
+        [pay_chain("clr-pay-a", 0, [("OA", 327), ("OB", 166), ("OC", 167),
+                                    ("OD", 160), ("OE", 80)])]))
+    check("re-paying an already covered range -> 409",
+          r.status_code == 409 and "pay-2026-10-13-m" in r.text)
+
+    # A correction voids po3:po4; the follow-up adjustment books negative
+    # deltas on seq 1. The paid snapshot stays frozen and the drift shows up
+    # as clawback balances on the paid chain.
+    popost("po3", "S05", "in", "2026-10-12T07:00:00Z")
+    r = client.post("/clearings/adjustments", json={
+        "clearing_id": "clr-pay-b", "base_clearing_id": "clr-pay-a"})
+    check("post-payout adjustment created", r.status_code == 200, r.text)
+    check("adjustment books the reversal on seq 1",
+          r.json()["seq"] == 1 and r.json()["net_amount_cents"] == -400)
+
+    g = client.get("/clearings/payouts/pay-2026-10-13-m").json()
+    check("GET payout reports the created marker", g["status"] == "created")
+    bal_a = {b["operator_id"]: b for c in g["chains"]
+             if c["clearing_id"] == "clr-pay-a" for b in c["balances"]}
+    check("paid snapshot frozen while balances report the drift",
+          bal_a["OA"]["paid_cents"] == 327 and bal_a["OA"]["current_cents"] == 167
+          and bal_a["OA"]["difference_cents"] == -160
+          and bal_a["OA"]["direction"] == "clawback_due"
+          and bal_a["OD"]["difference_cents"] == -160
+          and bal_a["OD"]["direction"] == "clawback_due"
+          and bal_a["OE"]["difference_cents"] == -80
+          and bal_a["OB"]["direction"] == "none"
+          and bal_a["OC"]["direction"] == "none", bal_a)
+    check("frozen payout operators never rewritten by later adjustments",
+          [(o["operator_id"], o["amount_cents"])
+           for c in g["chains"] if c["clearing_id"] == "clr-pay-a"
+           for o in c["operators"]]
+          == [("OA", 327), ("OB", 166), ("OC", 167), ("OD", 160), ("OE", 80)])
+    bal_c = {b["operator_id"]: b for c in g["chains"]
+             if c["clearing_id"] == "clr-pay-c" for b in c["balances"]}
+    check("untouched chain keeps settled balances",
+          all(b["direction"] == "none" for b in bal_c.values()))
+
+    # The follow-up payout settles exactly the new adjustment deltas.
+    r = client.post("/clearings/payouts", json=payout_body(
+        "pay-2026-10-13-b", "bank-20261013-004",
+        [pay_chain("clr-pay-a", 1, [("OA", -160), ("OD", -160), ("OE", -80)])]))
+    check("follow-up payout settles the adjustment deltas",
+          r.status_code == 200, r.text)
+    pb = r.json()
+    check("follow-up payout covers (0, 1] with a negative net",
+          pb["chains"][0]["from_seq"] == 0 and pb["chains"][0]["to_seq"] == 1
+          and pb["chains"][0]["entry_count"] == 3
+          and pb["chains"][0]["amount_cents"] == -400
+          and pb["total_amount_cents"] == -400)
+    g = client.get("/clearings/payouts/pay-2026-10-13-m").json()
+    check("once the deltas are paid the first payout's balances settle",
+          all(b["direction"] == "none"
+              for c in g["chains"] for b in c["balances"]))
+
+    # A zero-delta adjustment still advances the chain seq; paying it books an
+    # empty manifest.
+    r = client.post("/clearings/adjustments", json={
+        "clearing_id": "clr-pay-d", "base_clearing_id": "clr-pay-a"})
+    check("zero-delta adjustment advances the chain",
+          r.json()["seq"] == 2 and r.json()["entries"] == [])
+    r = client.post("/clearings/payouts", json=payout_body(
+        "pay-2026-10-13-z", "bank-20261013-005", [pay_chain("clr-pay-a", 2, [])]))
+    check("empty new range pays out with an empty manifest",
+          r.status_code == 200
+          and r.json()["chains"][0]["entry_count"] == 0
+          and r.json()["chains"][0]["amount_cents"] == 0
+          and r.json()["chains"][0]["operators"] == [])
+    r = client.post("/clearings/payouts", json=payout_body(
+        "pay-2026-10-13-stale", "ref-x", [pay_chain("clr-pay-a", 1, [])]))
+    check("expected_seq behind the last paid seq -> 409 already included",
+          r.status_code == 409 and "already included" in r.text)
+
+    # The payout tables are append-only at the storage layer.
+    with sqlite3.connect(os.environ["DB_PATH"]) as raw:
+        blocked_payout = []
+        for stmt in (
+            "UPDATE clearing_payouts SET total_amount_cents = 0"
+            " WHERE payout_id = 'pay-2026-10-13-m'",
+            "DELETE FROM clearing_payouts WHERE payout_id = 'pay-2026-10-13-m'",
+            "UPDATE clearing_payout_chains SET amount_cents = 0"
+            " WHERE payout_id = 'pay-2026-10-13-m'",
+            "DELETE FROM clearing_payout_chains"
+            " WHERE payout_id = 'pay-2026-10-13-m'",
+            "UPDATE clearing_payout_operators SET amount_cents = 0"
+            " WHERE payout_id = 'pay-2026-10-13-m'",
+            "DELETE FROM clearing_payout_operators"
+            " WHERE payout_id = 'pay-2026-10-13-m'",
+        ):
+            try:
+                raw.execute(stmt)
+            except sqlite3.Error:
+                blocked_payout.append(stmt)
+        check("payout tables cannot be updated or deleted",
+              len(blocked_payout) == 6)
+    check("unknown payout -> 404",
+          client.get("/clearings/payouts/nope").status_code == 404)
 
     # --- Tap-event quality scans ----------------------------------------------
     def qpost(event_id, passenger, station, tap, ts):
@@ -2508,13 +2747,16 @@ def run(client):
         n_resolved = raw.execute("SELECT COUNT(*) FROM refunds").fetchone()[0]
         n_clearing = raw.execute(
             "SELECT COUNT(*) FROM clearing_batches").fetchone()[0]
+        n_payouts = raw.execute(
+            "SELECT COUNT(*) FROM clearing_payouts").fetchone()[0]
         n_holds = raw.execute(
             "SELECT COUNT(*) FROM event_holds").fetchone()[0]
         n_hold_releases = raw.execute(
             "SELECT COUNT(*) FROM event_hold_releases").fetchone()[0]
     check("one processed audit per stored event", ops.get("event_processed") == n_events)
-    check("ten corrected audits (a2, ra2, dp2, dp4, dp5, op3 x2, op6, op5, op6 re-pair)",
-          ops.get("event_corrected") == 10)
+    check("eleven corrected audits (a2, ra2, dp2, dp4, dp5, op3 x2, op6, op5,"
+          " op6 re-pair, po3)",
+          ops.get("event_corrected") == 11)
     check("one created audit per recon batch", ops.get("recon_batch_created") == n_batches)
     check("one audit per network validation",
           ops.get("network_validated") == n_validations)
@@ -2526,6 +2768,8 @@ def run(client):
           ops.get("dispute_resolved") == n_resolved)
     check("one audit per clearing batch (initial and adjustments)",
           ops.get("clearing_closed") == n_clearing)
+    check("one audit per clearing payout batch",
+          ops.get("clearing_payout_created") == n_payouts)
     check("one audit per stored event review hold",
           ops.get("event_held") == n_holds)
     check("one audit per hold release",
@@ -2575,6 +2819,13 @@ def run(client):
     client.post("/clearings", json=dict(                                     # 422 inverted window
         clearing_body, clearing_id="clr-no-audit",
         window_start="2026-10-11T00:00:00Z", window_end="2026-10-10T00:00:00Z"))
+    client.post("/clearings/payouts", json=pay_multi)                        # duplicate payout
+    client.post("/clearings/payouts", json=dict(                             # 409 payout
+        pay_multi, external_ref="other-ref"))
+    client.post("/clearings/payouts", json=payout_body(                      # 404 unknown chain
+        "pay-no-audit", "ref-x", [pay_chain("no-such-chain", 0, [])]))
+    client.post("/clearings/payouts", json=payout_body(                      # 409 stale seq
+        "pay-no-audit-2", "ref-x", [pay_chain("clr-pay-c", 9, [])]))
     client.post("/events/review-holds", json=hold_body)                      # duplicate hold
     client.post("/events/review-holds", json=dict(hold_body, review_reason="x"))  # 409 hold
     client.post("/events/review-holds", json={                               # 422 unknown event
@@ -2651,8 +2902,9 @@ def run(client):
     append_audit(tmp, "dispute_opened", {"i": 6}, {"ok": True})
     append_audit(tmp, "dispute_resolved", {"i": 7}, {"ok": True})
     append_audit(tmp, "clearing_closed", {"i": 8}, {"ok": True})
+    append_audit(tmp, "clearing_payout_created", {"i": 9}, {"ok": True})
     rep = verify_chain(tmp)
-    check("fresh standalone chain verifies", rep["valid"] and rep["head_seq"] == 8)
+    check("fresh standalone chain verifies", rep["valid"] and rep["head_seq"] == 9)
     tmp.execute(
         "INSERT INTO network_validations (validation_id, payload_hash, payload,"
         " effective_start, effective_end, passed, result, created_at)"

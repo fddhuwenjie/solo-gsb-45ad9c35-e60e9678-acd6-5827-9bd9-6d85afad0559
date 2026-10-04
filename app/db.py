@@ -359,6 +359,87 @@ BEGIN
     SELECT RAISE(ABORT, 'clearing_entries is an immutable ledger: DELETE is not allowed');
 END;
 
+-- Clearing payout batches (清分付款批次). A payout settles, per first-closing
+-- chain, the ledger rows booked after the chain's last paid seq up to the
+-- caller-declared expected_seq (which must be the chain's latest batch at
+-- submission time). The per-operator manifest must equal the computed
+-- non-zero net of those rows exactly. All three tables are append-only:
+-- later clearing adjustment batches only append new ledger rows and never
+-- rewrite a paid snapshot; the payout status query reports the drift as
+-- top-up / clawback balances.
+CREATE TABLE IF NOT EXISTS clearing_payouts (
+    payout_id          TEXT PRIMARY KEY,
+    payload_hash       TEXT NOT NULL,     -- sha256 of the canonical request
+    payload            TEXT NOT NULL,     -- canonical JSON of the normalised request
+    external_ref       TEXT NOT NULL,     -- external payment reference
+    chain_count        INTEGER NOT NULL,
+    total_amount_cents INTEGER NOT NULL,  -- signed net across all chains
+    created_at         TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS clearing_payout_chains (
+    payout_id         TEXT NOT NULL REFERENCES clearing_payouts(payout_id),
+    seq               INTEGER NOT NULL,   -- 0-based, canonical (clearing_id) order
+    root_clearing_id  TEXT NOT NULL REFERENCES clearing_batches(clearing_id),
+    from_seq          INTEGER NOT NULL,   -- exclusive lower bound (-1 = never paid before)
+    to_seq            INTEGER NOT NULL,   -- expected_seq settled by this payout
+    entry_count       INTEGER NOT NULL,   -- ledger rows covered in (from_seq, to_seq]
+    amount_cents      INTEGER NOT NULL,   -- signed net of the covered rows
+    PRIMARY KEY (payout_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_payout_chains_root
+    ON clearing_payout_chains (root_clearing_id, to_seq);
+
+CREATE TABLE IF NOT EXISTS clearing_payout_operators (
+    payout_id         TEXT NOT NULL,
+    chain_seq         INTEGER NOT NULL,
+    seq               INTEGER NOT NULL,   -- 0-based operator order within the chain
+    root_clearing_id  TEXT NOT NULL,
+    operator_id       TEXT NOT NULL,
+    amount_cents      INTEGER NOT NULL,   -- signed net paid to the operator
+    PRIMARY KEY (payout_id, chain_seq, seq),
+    FOREIGN KEY (payout_id, chain_seq)
+        REFERENCES clearing_payout_chains (payout_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_payout_operators_root
+    ON clearing_payout_operators (root_clearing_id, operator_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_clearing_payouts_no_update
+BEFORE UPDATE ON clearing_payouts
+BEGIN
+    SELECT RAISE(ABORT, 'clearing_payouts is append-only: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_clearing_payouts_no_delete
+BEFORE DELETE ON clearing_payouts
+BEGIN
+    SELECT RAISE(ABORT, 'clearing_payouts is append-only: DELETE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_clearing_payout_chains_no_update
+BEFORE UPDATE ON clearing_payout_chains
+BEGIN
+    SELECT RAISE(ABORT, 'clearing_payout_chains is append-only: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_clearing_payout_chains_no_delete
+BEFORE DELETE ON clearing_payout_chains
+BEGIN
+    SELECT RAISE(ABORT, 'clearing_payout_chains is append-only: DELETE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_clearing_payout_operators_no_update
+BEFORE UPDATE ON clearing_payout_operators
+BEGIN
+    SELECT RAISE(ABORT, 'clearing_payout_operators is append-only: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_clearing_payout_operators_no_delete
+BEFORE DELETE ON clearing_payout_operators
+BEGIN
+    SELECT RAISE(ABORT, 'clearing_payout_operators is append-only: DELETE is not allowed');
+END;
+
 -- Tap-event quality scans. These tables are deliberately isolated from the
 -- settlement domain: a scan only ever reads events and appends its own rows.
 -- Events, trips, trip_charges, disputes and the audit_log are never touched by
@@ -517,7 +598,8 @@ CREATE TABLE IF NOT EXISTS audit_log (
                           'network_snapshot_created',
                           'dispute_opened', 'dispute_resolved',
                           'clearing_closed',
-                          'event_held', 'event_hold_released')),
+                          'event_held', 'event_hold_released',
+                          'clearing_payout_created')),
     occurred_at      TEXT NOT NULL,         -- ISO-8601, normalised to UTC
     request_summary  TEXT NOT NULL,         -- canonical JSON of the normalised request
     result_summary   TEXT NOT NULL,         -- canonical JSON of the normalised result
@@ -546,7 +628,7 @@ _AUDIT_OPERATIONS = (
     "event_processed", "event_corrected", "recon_batch_created",
     "network_validated", "network_snapshot_created",
     "dispute_opened", "dispute_resolved", "clearing_closed",
-    "event_held", "event_hold_released",
+    "event_held", "event_hold_released", "clearing_payout_created",
 )
 
 _AUDIT_UPGRADE = """
@@ -561,7 +643,8 @@ CREATE TABLE audit_log (
                           'network_snapshot_created',
                           'dispute_opened', 'dispute_resolved',
                           'clearing_closed',
-                          'event_held', 'event_hold_released')),
+                          'event_held', 'event_hold_released',
+                          'clearing_payout_created')),
     occurred_at      TEXT NOT NULL,
     request_summary  TEXT NOT NULL,
     result_summary   TEXT NOT NULL,

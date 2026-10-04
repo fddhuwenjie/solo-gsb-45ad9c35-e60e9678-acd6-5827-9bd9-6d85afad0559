@@ -248,7 +248,7 @@ AuditOperation = Literal[
     "event_processed", "event_corrected", "recon_batch_created",
     "network_validated", "network_snapshot_created",
     "dispute_opened", "dispute_resolved", "clearing_closed",
-    "event_held", "event_hold_released",
+    "event_held", "event_hold_released", "clearing_payout_created",
 ]
 
 
@@ -509,6 +509,75 @@ class ClearingBatchOut(BaseModel):
     net_amount_cents: int           # signed amount this batch books (initial gross; delta sum later)
     entries: list[ClearingEntryOut]
     operator_totals: list[ClearingOperatorTotal]  # cumulative chain-wide positions
+    created_at: str
+
+
+# ---------------------------------------------------------------------------
+# Clearing payout batches (清分付款批次)
+# ---------------------------------------------------------------------------
+
+
+class ClearingPayoutOperatorIn(BaseModel):
+    operator_id: str = Field(min_length=1, max_length=128)
+    amount_cents: int  # signed expected net of the chain's newly covered entries
+
+
+class ClearingPayoutChainIn(BaseModel):
+    clearing_id: str = Field(
+        min_length=1,
+        max_length=128,
+        description="The first closing (seq 0) of the chain to pay",
+    )
+    expected_seq: int = Field(
+        ge=0,
+        description="Must equal the chain's current latest batch seq",
+    )
+    operators: list[ClearingPayoutOperatorIn] = Field(
+        default_factory=list,
+        description="Expected per-operator net of the newly covered entries",
+    )
+
+
+class ClearingPayoutIn(BaseModel):
+    payout_id: str = Field(min_length=1, max_length=128)
+    external_ref: str = Field(
+        min_length=1,
+        max_length=256,
+        description="External payment reference recorded on the batch",
+    )
+    chains: list[ClearingPayoutChainIn] = Field(min_length=1)
+
+
+class ClearingPayoutOperatorOut(BaseModel):
+    operator_id: str
+    amount_cents: int             # frozen net this payout pays the operator
+
+
+class ClearingPayoutBalance(BaseModel):
+    operator_id: str
+    paid_cents: int               # cumulative paid across every payout of the chain
+    current_cents: int            # live chain-wide booked position
+    difference_cents: int         # current - paid
+    direction: Literal["none", "top_up_due", "clawback_due"]
+
+
+class ClearingPayoutChainOut(BaseModel):
+    clearing_id: str              # the first closing (root) of the paid chain
+    from_seq: int                 # exclusive lower bound; -1 = nothing paid before
+    to_seq: int                   # expected_seq this payout settles
+    entry_count: int              # ledger rows covered in (from_seq, to_seq]
+    amount_cents: int             # signed net of the covered rows
+    operators: list[ClearingPayoutOperatorOut]  # frozen per-operator nets
+    balances: list[ClearingPayoutBalance]       # live, recomputed on every read
+
+
+class ClearingPayoutOut(BaseModel):
+    payout_id: str
+    status: Literal["created", "duplicate"]
+    external_ref: str
+    chain_count: int
+    total_amount_cents: int       # signed net across all chains
+    chains: list[ClearingPayoutChainOut]
     created_at: str
 
 

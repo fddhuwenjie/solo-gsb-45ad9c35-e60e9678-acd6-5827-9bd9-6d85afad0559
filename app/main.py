@@ -73,6 +73,8 @@ from .models import (
     ClearingImpactTrip,
     ClearingIn,
     ClearingOperatorTotal,
+    ClearingPayoutIn,
+    ClearingPayoutOut,
     CorrectionPreviewIn,
     CorrectionPreviewOut,
     DisputeImpact,
@@ -110,6 +112,12 @@ from .models import (
     TripOut,
 )
 from .network import NetEdge, validate_network
+from .payouts import (
+    canonical_payout_payload,
+    new_entry_totals,
+    payload_hash as payout_payload_hash,
+    payout_response,
+)
 from .privacy import (
     UnmappedStationsError,
     build_export,
@@ -155,7 +163,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Transit Fare Settlement API",
-    version="1.10.0",
+    version="1.11.0",
     lifespan=lifespan,
 )
 
@@ -1832,6 +1840,236 @@ def get_clearing(
 
 
 # ---------------------------------------------------------------------------
+# Clearing payout batches (清分付款批次)
+# ---------------------------------------------------------------------------
+
+
+def _load_payout(db: Database, payout_id: str, status: str) -> ClearingPayoutOut:
+    row = db.conn.execute(
+        "SELECT * FROM clearing_payouts WHERE payout_id = ?", (payout_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"clearing payout '{payout_id}' not found"
+        )
+    return payout_response(db.conn, row, status)
+
+
+@app.post("/clearings/payouts", response_model=ClearingPayoutOut, status_code=200)
+def create_clearing_payout(
+    body: ClearingPayoutIn,
+    db: Database = Depends(get_db),
+) -> ClearingPayoutOut:
+    """Settle the unpaid tail of one or more clearing chains. In a single
+    transaction every referenced first closing is checked, the ledger rows
+    booked after the chain's last paid seq up to the caller-declared
+    ``expected_seq`` (which must be the chain's current latest batch) are
+    summed per operator, and the submitted manifest must equal that computed
+    non-zero net exactly. The whole batch is refused (nothing is written)
+    when a chain is missing, a seq is stale, the pending rows are already
+    covered by another payout, or the manifest mismatches. On success the
+    immutable payout snapshot and its per-operator rows commit together with
+    the audit record."""
+    chain_ids = [c.clearing_id for c in body.chains]
+    if len(set(chain_ids)) != len(chain_ids):
+        raise HTTPException(status_code=422, detail="duplicate clearing_id in chains")
+    for c in body.chains:
+        operators = [o.operator_id for o in c.operators]
+        if len(set(operators)) != len(operators):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"duplicate operator_id in the manifest for chain"
+                    f" '{c.clearing_id}'"
+                ),
+            )
+
+    canonical_payload = canonical_payout_payload(body)
+    p_hash = payout_payload_hash(canonical_payload)
+
+    with db.lock(), db.conn:
+        existing = db.conn.execute(
+            "SELECT payload_hash FROM clearing_payouts WHERE payout_id = ?",
+            (body.payout_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["payload_hash"] != p_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"payout_id '{body.payout_id}' already exists with a"
+                        " different payload"
+                    ),
+                )
+            # Idempotent replay: the frozen snapshot is never recomputed.
+            return _load_payout(db, body.payout_id, "duplicate")
+
+        specs: list[dict] = []
+        for chain in canonical_payload["chains"]:
+            root_id = chain["clearing_id"]
+            root = db.conn.execute(
+                "SELECT * FROM clearing_batches WHERE clearing_id = ?",
+                (root_id,),
+            ).fetchone()
+            if root is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"clearing chain '{root_id}' not found; payouts"
+                        " reference the first closing (seq 0) of a chain"
+                    ),
+                )
+            if root["kind"] != "initial" or root["seq"] != 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"clearing_id '{root_id}' is an adjustment batch;"
+                        " payouts must reference the first closing of the chain"
+                    ),
+                )
+            last_paid = db.conn.execute(
+                "SELECT COALESCE(MAX(to_seq), -1) FROM clearing_payout_chains"
+                " WHERE root_clearing_id = ?",
+                (root_id,),
+            ).fetchone()[0]
+            expected_seq = chain["expected_seq"]
+            if expected_seq <= last_paid:
+                # The pending rows up to expected_seq are already covered by
+                # an earlier payout; paying them again would double-settle.
+                covering = db.conn.execute(
+                    "SELECT payout_id, to_seq FROM clearing_payout_chains"
+                    " WHERE root_clearing_id = ? AND to_seq >= ?"
+                    " ORDER BY to_seq DESC LIMIT 1",
+                    (root_id, expected_seq),
+                ).fetchone()
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"chain '{root_id}': the pending entries up to seq"
+                        f" {expected_seq} are already included in payout"
+                        f" '{covering['payout_id']}' (paid through seq"
+                        f" {covering['to_seq']})"
+                    ),
+                )
+            latest_seq = db.conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM clearing_batches"
+                " WHERE root_clearing_id = ?",
+                (root_id,),
+            ).fetchone()[0]
+            if expected_seq != latest_seq:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"chain '{root_id}': expected_seq {expected_seq} is"
+                        f" stale; the chain's latest batch is seq {latest_seq}"
+                    ),
+                )
+            totals, entry_count = new_entry_totals(
+                db.conn, root_id, last_paid, expected_seq
+            )
+            computed = {op: amount for op, amount in totals.items() if amount != 0}
+            manifest = {
+                o["operator_id"]: o["amount_cents"] for o in chain["operators"]
+            }
+            if manifest != computed:
+                diffs = []
+                for op in sorted(set(manifest) | set(computed)):
+                    expected, actual = manifest.get(op), computed.get(op)
+                    if expected != actual:
+                        diffs.append(
+                            f"{op}: manifest "
+                            f"{expected if expected is not None else 'absent'}"
+                            " != computed "
+                            f"{actual if actual is not None else 'absent'}"
+                        )
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"chain '{root_id}': the operator manifest does not"
+                        " match the new clearing entries in"
+                        f" ({last_paid}, {expected_seq}]: " + "; ".join(diffs)
+                    ),
+                )
+            specs.append({
+                "root_clearing_id": root_id,
+                "from_seq": last_paid,
+                "to_seq": expected_seq,
+                "entry_count": entry_count,
+                "amount_cents": sum(computed.values()),
+                "operators": sorted(computed.items()),
+            })
+
+        created_at = iso_str(datetime.now(timezone.utc))
+        db.conn.execute(
+            "INSERT INTO clearing_payouts (payout_id, payload_hash, payload,"
+            " external_ref, chain_count, total_amount_cents, created_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (
+                body.payout_id,
+                p_hash,
+                canonical_json(canonical_payload),
+                body.external_ref,
+                len(specs),
+                sum(s["amount_cents"] for s in specs),
+                created_at,
+            ),
+        )
+        for seq, spec in enumerate(specs):
+            db.conn.execute(
+                "INSERT INTO clearing_payout_chains (payout_id, seq,"
+                " root_clearing_id, from_seq, to_seq, entry_count, amount_cents)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (
+                    body.payout_id,
+                    seq,
+                    spec["root_clearing_id"],
+                    spec["from_seq"],
+                    spec["to_seq"],
+                    spec["entry_count"],
+                    spec["amount_cents"],
+                ),
+            )
+            db.conn.executemany(
+                "INSERT INTO clearing_payout_operators (payout_id, chain_seq,"
+                " seq, root_clearing_id, operator_id, amount_cents)"
+                " VALUES (?,?,?,?,?,?)",
+                [
+                    (
+                        body.payout_id,
+                        seq,
+                        op_seq,
+                        spec["root_clearing_id"],
+                        operator_id,
+                        amount,
+                    )
+                    for op_seq, (operator_id, amount) in enumerate(spec["operators"])
+                ],
+            )
+        response = _load_payout(db, body.payout_id, "created")
+        append_audit(
+            db.conn,
+            "clearing_payout_created",
+            canonical_payload,
+            response.model_dump(),
+        )
+
+    return response
+
+
+@app.get("/clearings/payouts/{payout_id}", response_model=ClearingPayoutOut)
+def get_clearing_payout(
+    payout_id: str,
+    db: Database = Depends(get_db),
+) -> ClearingPayoutOut:
+    with db.lock():
+        # The frozen snapshot comes from the append-only rows; the per-chain
+        # balances are recomputed live, so clearing adjustments booked after
+        # the payout surface as top-up/clawback differences without ever
+        # rewriting the paid records.
+        return _load_payout(db, payout_id, "created")
+
+
+# ---------------------------------------------------------------------------
 # Tap-event quality scans (read-only analysis, isolated append-only tables)
 # ---------------------------------------------------------------------------
 
@@ -2277,7 +2515,7 @@ def list_audit(
         pattern="^(event_processed|event_corrected|recon_batch_created"
                 "|network_validated|network_snapshot_created"
                 "|dispute_opened|dispute_resolved|clearing_closed"
-                "|event_held|event_hold_released)$",
+                "|event_held|event_hold_released|clearing_payout_created)$",
         description="Filter by operation type",
     ),
     after: int = Query(default=0, ge=0, description="Return records with seq > after"),
