@@ -513,6 +513,120 @@ class ClearingBatchOut(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Clearing payout batches (清分付款批次)
+# ---------------------------------------------------------------------------
+
+
+class PayoutChainIn(BaseModel):
+    root_clearing_id: str = Field(
+        min_length=1,
+        max_length=128,
+        description="The chain's first closing (seq 0) whose new ledger is paid out",
+    )
+    expected_seq: int = Field(
+        ge=0,
+        description="Must equal the chain's current latest batch seq at submission",
+    )
+
+
+class PayoutOperatorNetIn(BaseModel):
+    operator_id: str = Field(min_length=1, max_length=128)
+    expected_net_amount_cents: int  # expected signed net total across every covered chain
+
+
+class PayoutIn(BaseModel):
+    payout_id: str = Field(min_length=1, max_length=128)
+    external_payment_ref: str = Field(
+        min_length=1,
+        max_length=256,
+        description="Caller-side payment reference, frozen on the payout snapshot",
+    )
+    chains: list[PayoutChainIn] = Field(
+        min_length=1,
+        description="First closings whose new (not yet paid out) ledger rows are settled",
+    )
+    operator_net_amounts: list[PayoutOperatorNetIn] = Field(
+        min_length=1,
+        description="Expected per-operator signed net total; must exactly match the ledger",
+    )
+
+
+class PayoutChainOut(BaseModel):
+    seq: int                        # 0-based position inside the payout (canonical order)
+    root_clearing_id: str
+    expected_seq: int               # the chain's latest batch seq covered by this payout
+    last_paid_seq: int              # seq already covered by earlier payouts (-1 = never paid)
+    covered_seqs: list[int]         # clearing batch seqs this payout pays, ascending
+    entry_count: int                # frozen ledger rows covered on this chain
+    net_amount_cents: int           # signed net paid out for this chain
+
+
+class PayoutEntryOut(BaseModel):
+    """One frozen clearing-ledger row covered by the payout (the immutable
+    payment snapshot)."""
+    seq: int
+    root_clearing_id: str
+    clearing_id: str
+    clearing_seq: int
+    kind: Literal["initial", "adjustment"]
+    trip_id: str
+    passenger_id: str
+    from_station: str
+    to_station: str
+    ended_at: str
+    operator_id: str
+    amount_cents: int               # signed amount of the covered clearing ledger row
+
+
+class PayoutOperatorTotal(BaseModel):
+    operator_id: str
+    amount_cents: int               # signed net total frozen by this payout
+
+
+class PayoutOut(BaseModel):
+    payout_id: str
+    status: Literal["created", "duplicate"]
+    external_payment_ref: str
+    chain_count: int
+    entry_count: int
+    net_amount_cents: int
+    chains: list[PayoutChainOut]
+    operator_totals: list[PayoutOperatorTotal]
+    entries: list[PayoutEntryOut]
+    created_at: str
+
+
+class PayoutStatusChain(BaseModel):
+    root_clearing_id: str
+    paid_through_seq: int           # latest batch seq covered by any payout (-1 = never paid)
+    latest_seq: int                 # the chain's current latest batch seq
+    current_amount_cents: int       # live chain-wide position across all batches
+    paid_amount_cents: int          # amount already covered by payouts on this chain
+    difference_cents: int           # current - paid (unpaid follow-up delta)
+
+
+class PayoutOperatorBalance(BaseModel):
+    operator_id: str
+    frozen_amount_cents: int        # this payout's snapshot amount for the operator
+    paid_amount_cents: int          # total paid across the covered chains (all payouts)
+    current_amount_cents: int       # live position across the covered chains now
+    difference_cents: int           # current - paid
+    direction: Literal["none", "top_up_due", "clawback_due"]
+
+
+class PayoutStatusOut(BaseModel):
+    payout_id: str
+    status: Literal["created"]
+    external_payment_ref: str
+    chain_count: int
+    entry_count: int
+    net_amount_cents: int           # frozen payout total
+    chains: list[PayoutStatusChain]
+    operator_balances: list[PayoutOperatorBalance]
+    created_at: str
+
+
+# ---------------------------------------------------------------------------
 # Tap-event quality scans
 # ---------------------------------------------------------------------------
 

@@ -1,6 +1,6 @@
 # 公共交通票价结算 API
 
-基于 FastAPI + SQLite 的公交/地铁票价结算与换乘网络校验服务。客户端提交刷卡事件，服务按事件时间配对行程，依据可配置的分区票价、换乘优惠以及 UTC 自然日 / 自然周（ISO 周，周一起算）封顶规则计算应收金额；迟到或更正的记录会触发受影响乘客全量重算并返回每段行程的计费依据与调账差额。此外提供 `POST /reconciliations` 扣款对账接口，按出站时间快照内部行程费用，与外部扣款明细进行批次化一对一核对。`POST /network/validate` 还可对带生效时间的换乘网络（线路段 + 步行换乘边）按时间边界切片构图，校验枢纽可达性、双向换乘对称性、重复 / 自环边与重叠生效区间；通过的版本可用 `POST /network/snapshots` 固化并随时查询。票价争议通过 `POST /disputes` 提起（创建时冻结行程收费快照、申请额不得超过快照应收）、`POST /disputes/{id}/resolve` 凭乐观版本一次性结案并写入不可变退款流水；结案后若行程因事件更正而重算，`GET /disputes/{id}` 会实时报告待补退 / 待追回差额而不覆盖已结退款。此外提供运营方票款清分接口 `POST /clearings`：首次关账按出站时间冻结 UTC 半开结算区间与按起终点站配置的运营方万分比（10000=100%）规则，区间内行程缺匹配规则或份额合计不为 10000 时整批拒绝；每笔实收按规则拆分，除不尽的分依次按小数余数降序、运营方 ID 升序分配，并写入带触发器保护的不可变流水。刷卡更正导致行程金额、站点或配对变化后，已关账流水绝不改写；后续批次用新的 `clearing_id` 经 `POST /clearings/adjustments` 引用首次关账，沿用冻结区间与规则，按当前应分金额减去历次累计只追加正负差额（行程消失全额冲回、站点对变化时旧运营方冲回新运营方补入），重复调整不会重复入账。同 `clearing_id` 同载荷幂等、异载荷返回 `409`，可用 `GET /clearings/{id}` 查询冻结结果。此外提供 `POST /event-quality/scans` 刷卡事件质量扫描：在 UTC 半开区间内按 `(occurred_at, seq)` 扫描事件，识别窗口内重复同类刷卡与出站后未达到站点最短行程秒数便再次进站的时序冲突，结果只写入独立的只追加表，可随时用 `GET /event-quality/scans/{id}` 查询，绝不改动事件、行程、账单或审计。最后提供 `POST /privacy/exports` 匿名出行轨迹导出：在 UTC 半开区间（按进站时间）内读取行程，用服务器配置的 `PRIVACY_SALT` 对 `passenger_id` 做稳定 HMAC 假名化（同一乘客跨多段行程、跨多次导出保持同一假名），按（纪元对齐的 UTC 时间桶、起点站组、终点站组）统计去重乘客数，等价类人数不足最小群体 `k` 时**整组抑制**（不逐行泄露），只返回保留行程的假名 / 时间桶 / 站点组；结果只追加保存，相同 `export_id` 同载荷幂等、不同载荷 `409`，可用 `GET /privacy/exports/{id}` 查询。突发中断时可调用 `POST /disruption/replans` 疏运重排：提交最小换乘秒数、按站序排列（含 UTC 到发时刻与核定容量）的替代班次和必须整体成行的乘客组（origin / destination / ready_at / 人数），服务按 `(ready_at, group_id)` 依次在各相邻区段剩余容量约束下为每组选出**最早到达**行程（同到达再取换乘更少、班次 ID 序列字典序更小者），分配后逐段扣减容量，无法成行则给出滞留原因；班次时刻校验失败不落库，结果冻结保存，相同 `replan_id` 同载荷幂等、不同载荷 `409`，可用 `GET /disruption/replans/{id}` 查询。最后提供刷卡事件**复核暂存与释放**：`POST /events/review-holds` 提交 `hold_id`、乘客、事件 ID 列表与复核原因，服务在一个事务内确认事件归属并冻结每条事件的完整载荷快照、将其标记为 `held`（暂不参与配对、计费与待处理查询）；任一事件已被对账批次、清分批次或已结案争议引用则整批 `409` 且不改变状态。同 `hold_id` 同载荷幂等、异载荷 `409`；暂存期间用相同 `event_id` 提交更正一律拒绝。`POST /events/review-holds/{hold_id}/release` 凭期望版本释放，按原 `seq` 与事件时间重新结算并返回受影响行程的增减额；版本冲突或事件快照不一致时拒绝释放并保持 `held`。暂存记录与事件快照不可修改，释放结果另行只追加，`GET /events/review-holds/{hold_id}` 查询冻结状态。运营人员在真正提交更正前，还可用 `POST /events/correction-preview` 做**更正影响预览**：提交已有 `event_id` 与替换后的乘客 / 站点 / 进出站类型 / UTC 时间，服务**只读取当前快照、在内存中**按正式结算规则模拟受影响乘客（乘客变更时原、新乘客都模拟），返回新旧行程与逐段金额调账，并逐项列出因行程消失、站点或金额变化而受影响的对账批次、清分批次与已结案争议及原因；预览不写任何事件、行程、账单、审计链或冻结表，也不改变 `/events` 的幂等与更正语义。
+基于 FastAPI + SQLite 的公交/地铁票价结算与换乘网络校验服务。客户端提交刷卡事件，服务按事件时间配对行程，依据可配置的分区票价、换乘优惠以及 UTC 自然日 / 自然周（ISO 周，周一起算）封顶规则计算应收金额；迟到或更正的记录会触发受影响乘客全量重算并返回每段行程的计费依据与调账差额。此外提供 `POST /reconciliations` 扣款对账接口，按出站时间快照内部行程费用，与外部扣款明细进行批次化一对一核对。`POST /network/validate` 还可对带生效时间的换乘网络（线路段 + 步行换乘边）按时间边界切片构图，校验枢纽可达性、双向换乘对称性、重复 / 自环边与重叠生效区间；通过的版本可用 `POST /network/snapshots` 固化并随时查询。票价争议通过 `POST /disputes` 提起（创建时冻结行程收费快照、申请额不得超过快照应收）、`POST /disputes/{id}/resolve` 凭乐观版本一次性结案并写入不可变退款流水；结案后若行程因事件更正而重算，`GET /disputes/{id}` 会实时报告待补退 / 待追回差额而不覆盖已结退款。此外提供运营方票款清分接口 `POST /clearings`：首次关账按出站时间冻结 UTC 半开结算区间与按起终点站配置的运营方万分比（10000=100%）规则，区间内行程缺匹配规则或份额合计不为 10000 时整批拒绝；每笔实收按规则拆分，除不尽的分依次按小数余数降序、运营方 ID 升序分配，并写入带触发器保护的不可变流水。刷卡更正导致行程金额、站点或配对变化后，已关账流水绝不改写；后续批次用新的 `clearing_id` 经 `POST /clearings/adjustments` 引用首次关账，沿用冻结区间与规则，按当前应分金额减去历次累计只追加正负差额（行程消失全额冲回、站点对变化时旧运营方冲回新运营方补入），重复调整不会重复入账。同 `clearing_id` 同载荷幂等、异载荷返回 `409`，可用 `GET /clearings/{id}` 查询冻结结果。在清分之上还提供**清分付款批次** `POST /clearings/payouts`：付款系统提交唯一 `payout_id`、若干首账 `root_clearing_id`（每条链带 `expected_seq`）、逐运营方期望净额与外部付款参考号；服务在一个事务内读取每条链**上次付款水位之后到 expected_seq 的新增清分批次流水**并按运营方汇总，要求 `expected_seq` 必须是该链当前最新批次、清单恰好覆盖这些新增流水、金额与运营方集合完全一致——链不存在、引用追补批次、序号过期 / 超前、待付流水已被其他付款批次纳入或期望净额对不上时整批拒绝。成功后写入不可变付款快照（逐链覆盖区间 + 逐流水逐运营方明细），同 `payout_id` 同载荷幂等、异载荷 `409`。此后新增清分追补只追加新流水、绝不改写已付款记录，`GET /clearings/payouts/{id}` 实时显示每个运营方的待补付 / 待追回余额。此外提供 `POST /event-quality/scans` 刷卡事件质量扫描：在 UTC 半开区间内按 `(occurred_at, seq)` 扫描事件，识别窗口内重复同类刷卡与出站后未达到站点最短行程秒数便再次进站的时序冲突，结果只写入独立的只追加表，可随时用 `GET /event-quality/scans/{id}` 查询，绝不改动事件、行程、账单或审计。最后提供 `POST /privacy/exports` 匿名出行轨迹导出：在 UTC 半开区间（按进站时间）内读取行程，用服务器配置的 `PRIVACY_SALT` 对 `passenger_id` 做稳定 HMAC 假名化（同一乘客跨多段行程、跨多次导出保持同一假名），按（纪元对齐的 UTC 时间桶、起点站组、终点站组）统计去重乘客数，等价类人数不足最小群体 `k` 时**整组抑制**（不逐行泄露），只返回保留行程的假名 / 时间桶 / 站点组；结果只追加保存，相同 `export_id` 同载荷幂等、不同载荷 `409`，可用 `GET /privacy/exports/{id}` 查询。突发中断时可调用 `POST /disruption/replans` 疏运重排：提交最小换乘秒数、按站序排列（含 UTC 到发时刻与核定容量）的替代班次和必须整体成行的乘客组（origin / destination / ready_at / 人数），服务按 `(ready_at, group_id)` 依次在各相邻区段剩余容量约束下为每组选出**最早到达**行程（同到达再取换乘更少、班次 ID 序列字典序更小者），分配后逐段扣减容量，无法成行则给出滞留原因；班次时刻校验失败不落库，结果冻结保存，相同 `replan_id` 同载荷幂等、不同载荷 `409`，可用 `GET /disruption/replans/{id}` 查询。最后提供刷卡事件**复核暂存与释放**：`POST /events/review-holds` 提交 `hold_id`、乘客、事件 ID 列表与复核原因，服务在一个事务内确认事件归属并冻结每条事件的完整载荷快照、将其标记为 `held`（暂不参与配对、计费与待处理查询）；任一事件已被对账批次、清分批次或已结案争议引用则整批 `409` 且不改变状态。同 `hold_id` 同载荷幂等、异载荷 `409`；暂存期间用相同 `event_id` 提交更正一律拒绝。`POST /events/review-holds/{hold_id}/release` 凭期望版本释放，按原 `seq` 与事件时间重新结算并返回受影响行程的增减额；版本冲突或事件快照不一致时拒绝释放并保持 `held`。暂存记录与事件快照不可修改，释放结果另行只追加，`GET /events/review-holds/{hold_id}` 查询冻结状态。运营人员在真正提交更正前，还可用 `POST /events/correction-preview` 做**更正影响预览**：提交已有 `event_id` 与替换后的乘客 / 站点 / 进出站类型 / UTC 时间，服务**只读取当前快照、在内存中**按正式结算规则模拟受影响乘客（乘客变更时原、新乘客都模拟），返回新旧行程与逐段金额调账，并逐项列出因行程消失、站点或金额变化而受影响的对账批次、清分批次与已结案争议及原因；预览不写任何事件、行程、账单、审计链或冻结表，也不改变 `/events` 的幂等与更正语义。
 
 ## 启动
 
@@ -48,6 +48,13 @@ SQLite 数据文件持久化在 `transit-data` 卷中（容器内路径 `/data/t
   - **不重复入账**：每个批次都从"当前目标 − 链上累计"重新计算，因此同载荷重放幂等、以新批次号在状态未变时再次追补只会写入空批次（零差额），已冲回的行程再次消失不会二次冲回。
   - **幂等与原子性**：同 `clearing_id` 同载荷返回已存结果（`status="duplicate"`，规则/份额数组顺序不影响载荷判定），异载荷 `409`；批次行与其全部流水行、审计记录同事务原子提交。
 - **票价争议与退款**：`POST /disputes` 创建时冻结行程当时的收费快照，申请退款额不得超过快照应收；`POST /disputes/{id}/resolve` 凭乐观版本（open 为 1、结案后为 2）一次性结案，同事务写入一条不可变退款流水（存储层触发器禁止更新/删除）。结案后行程若因事件更正而重算，`GET /disputes/{id}` 按"快照应收 − 已退金额 = 乘客净付"与当前应收对比，报告待补退（`top_up_due`）或待追回（`clawback_due`）差额；差额仅报告，已结退款绝不被覆盖。相同请求幂等，版本冲突返回 `409`。
+- **清分付款批次**：
+  - **付款范围**（`POST /clearings/payouts`）：每个 `root_clearing_id` 必须是存在的**首次关账**（seq=0）。服务读取该链上批次序号严格大于**上次付款水位**（本链历次付款 `expected_seq` 的最大值，未付过为 -1）、且不超过本次 `expected_seq` 的全部不可变清分流水，按运营方在整批内汇总净额。
+  - **整批拒绝**：链不存在 → `404`；引用的是追补批次而非首账、同一付款请求中链或运营方重复 → `422`；`expected_seq` **落后**于链上当前最新批次（视图过期）或**超前**于链上最新批次（批次尚不存在）→ `409`；本次范围内没有任何新增流水（链已付到该序号）→ `409`；范围内任一流水已被其他付款批次纳入（每条清分批次至多付一次）→ `409`。
+  - **期望净额必须完全相等**：请求的 `operator_net_amounts` 必须与流水汇总结果**运营方集合完全相同、金额（带符号整数分）逐一相等**；缺运营方、多运营方或金额不符均 `422` 整批拒绝，错误信息给出期望与账面金额。全部拒绝均不写任何付款 / 覆盖 / 明细行，也不推进水位。
+  - **不可变快照**：成功后同事务写入 `payouts`（含外部付款参考号与完整响应 JSON 快照）、`payout_chains`（逐链 `last_paid_seq` / `expected_seq` / 覆盖批次序号）、`payout_entries`（逐流水逐运营方的带符号金额副本），三表均带禁止 `UPDATE`/`DELETE` 的触发器，并追加一条 `clearing_payout_created` 审计记录。
+  - **幂等与冲突**：相同 `payout_id` + 相同载荷（链与运营方数组顺序不影响判定）重放返回已存快照（`status="duplicate"`，绝不重复标记流水为已付）；同号异载荷（含外部参考号不同）返回 `409`。
+  - **追补不改写、差额可查**：付款之后新增清分追补只追加新的 `clearing_entries`，已付款流水与付款快照绝不改写。`GET /clearings/payouts/{payout_id}` 在返回冻结快照的同时，对其覆盖的每条链实时重算：`current_amount_cents`（链上当前累计）− `paid_amount_cents`（本链历次付款合计）= 差额，逐运营方给出 `top_up_due`（正数，待补付）/ `clawback_due`（负数，待追回）/ `none`；后续付款批次把新追补批次付清后差额归零。
 
 ## 接口
 
@@ -752,6 +759,129 @@ curl -X POST http://localhost:8000/clearings/adjustments \
 curl http://localhost:8000/clearings/clr-2026-10-10-a
 ```
 
+### `POST /clearings/payouts` — 清分付款批次
+
+运营方已有清分流水，付款系统需要知道哪些金额已经实际结算。调用方提交唯一 `payout_id`、外部付款参考号、若干**首账**链（每条给出 `root_clearing_id` 与 `expected_seq`）以及逐运营方期望净额。服务在**一个事务**内读取每条链自上次付款水位之后、到 `expected_seq` 为止的新增清分流水（首账与各追补批次的带符号行都在范围内），按运营方汇总，并要求 `expected_seq` 正是该链当前最新批次、清单恰好覆盖新增流水、期望净额与账面完全一致。
+
+请求示例（对上例链 `clr-2026-10-10-a`，链上当前最新批次为 seq 4，链上累计 OA 487 / OB 166 / OC 167 / OD 320 / OE 160）：
+
+```bash
+curl -X POST http://localhost:8000/clearings/payouts \
+  -H "Content-Type: application/json" \
+  -d '{
+    "payout_id": "pay-2026-10-11-a",
+    "external_payment_ref": "WIRE-2026-10-11-0001",
+    "chains": [
+      {"root_clearing_id": "clr-2026-10-10-a", "expected_seq": 4}
+    ],
+    "operator_net_amounts": [
+      {"operator_id": "OA", "expected_net_amount_cents": 487},
+      {"operator_id": "OB", "expected_net_amount_cents": 166},
+      {"operator_id": "OC", "expected_net_amount_cents": 167},
+      {"operator_id": "OD", "expected_net_amount_cents": 320},
+      {"operator_id": "OE", "expected_net_amount_cents": 160}
+    ]
+  }'
+```
+
+- 一次付款可以同时覆盖**多条链**；`chains` 内重复首账或 `operator_net_amounts` 内重复运营方返回 `422`。
+- **拒绝条件**：首账不存在 → `404`；`root_clearing_id` 指向追补批次、重复链 / 重复运营方 → `422`；`expected_seq` 落后于链上最新批次（过期视图）或超前（批次尚不存在）→ `409`；本链已付到该序号、范围内没有新增流水，或范围内流水已被其他付款批次纳入 → `409`；期望净额与流水汇总在运营方集合或金额上有任何不一致 → `422`（错误信息同时给出期望与账面金额）。任一检查失败都**整批回滚**，不推进任何链的付款水位。
+- 成功响应中 `chains[]` 给出每链的 `last_paid_seq`（上次水位，-1 表示首次付款）、`covered_seqs`（本次实际覆盖的清分批次序号）、行数与净额；`operator_totals` 为整批逐运营方净额；`entries[]` 是付款快照——逐条复制范围内清分流水（`clearing_seq`、`kind`、`trip_id`、站点、出站时间、运营方、带符号金额）。
+- **幂等与冲突**：相同 `payout_id` + 相同载荷（链 / 运营方数组顺序不影响判定）重放返回同一快照（`status="duplicate"`）；同号异载荷（如改了外部参考号）返回 `409`。
+
+响应示例（节选）：
+
+```json
+{
+  "payout_id": "pay-2026-10-11-a",
+  "status": "created",
+  "external_payment_ref": "WIRE-2026-10-11-0001",
+  "chain_count": 1,
+  "entry_count": 20,
+  "net_amount_cents": 1300,
+  "chains": [
+    {"seq": 0, "root_clearing_id": "clr-2026-10-10-a",
+     "expected_seq": 4, "last_paid_seq": -1,
+     "covered_seqs": [0, 1, 3, 4],
+     "entry_count": 20, "net_amount_cents": 1300}
+  ],
+  "operator_totals": [
+    {"operator_id": "OA", "amount_cents": 487},
+    {"operator_id": "OB", "amount_cents": 166},
+    {"operator_id": "OC", "amount_cents": 167},
+    {"operator_id": "OD", "amount_cents": 320},
+    {"operator_id": "OE", "amount_cents": 160}
+  ],
+  "entries": [
+    {"seq": 0, "root_clearing_id": "clr-2026-10-10-a",
+     "clearing_id": "clr-2026-10-10-a", "clearing_seq": 0,
+     "kind": "initial", "trip_id": "op1:op2", "passenger_id": "OP",
+     "from_station": "S01", "to_station": "S04",
+     "ended_at": "2026-10-10T08:30:00Z",
+     "operator_id": "OA", "amount_cents": 167},
+    {"seq": 9, "root_clearing_id": "clr-2026-10-10-a",
+     "clearing_id": "clr-2026-10-10-b", "clearing_seq": 1,
+     "kind": "adjustment", "trip_id": "op3:op4", "passenger_id": "OP",
+     "from_station": "S05", "to_station": "S02",
+     "ended_at": "2026-10-10T09:30:00Z",
+     "operator_id": "OE", "amount_cents": -80}
+  ],
+  "created_at": "2026-10-11T09:00:00Z"
+}
+```
+
+付款之后再提交追补批次（新 `clearing_id`）只追加新的清分流水；下一个付款批次只需把 `expected_seq` 指向新的最新批次、`operator_net_amounts` 填新流水的汇总（如某追补为净零重分，净额可能为正负数相加为 0），其 `last_paid_seq` 为上一次水位、`covered_seqs` 只含新批次。
+
+### `GET /clearings/payouts/{payout_id}` — 付款状态与待补付 / 待追回余额
+
+返回付款创建时固化的快照（外部参考号、逐链覆盖区间、`net_amount_cents`、逐运营方 `frozen_amount_cents`），并**实时**重算每条覆盖链与每个运营方的余额：当前链上累计 `current_amount_cents` 减去本链历次付款合计 `paid_amount_cents` 即未结差额。
+
+- `direction="top_up_due"`、`difference_cents > 0`：付款后又有正向追补，运营方**待补付**；
+- `direction="clawback_due"`、`difference_cents < 0`：付款后出现负向追补（冲回），运营方**待追回**；
+- `direction="none"`：无差额。后续付款批次把新追补付清后，差额自动归零。
+- `chains[].paid_through_seq` 为该链当前已付到的批次序号（-1 表示从未付款），`latest_seq` 为链上当前最新批次；二者不同即说明还有未付款的清分批次。冻结快照在任何情况下都不被改写。不存在返回 `404`。
+
+```bash
+curl http://localhost:8000/clearings/payouts/pay-2026-10-11-a
+```
+
+响应示例（付款后追加了一个净零追补批次 seq 5：OB/OC 待补付、OD/OE 待追回，整链总额不变）：
+
+```json
+{
+  "payout_id": "pay-2026-10-11-a",
+  "status": "created",
+  "external_payment_ref": "WIRE-2026-10-11-0001",
+  "chain_count": 1,
+  "entry_count": 20,
+  "net_amount_cents": 1300,
+  "chains": [
+    {"root_clearing_id": "clr-2026-10-10-a",
+     "paid_through_seq": 4, "latest_seq": 5,
+     "current_amount_cents": 1300, "paid_amount_cents": 1300,
+     "difference_cents": 0}
+  ],
+  "operator_balances": [
+    {"operator_id": "OA", "frozen_amount_cents": 487,
+     "paid_amount_cents": 487, "current_amount_cents": 487,
+     "difference_cents": 0, "direction": "none"},
+    {"operator_id": "OB", "frozen_amount_cents": 166,
+     "paid_amount_cents": 166, "current_amount_cents": 299,
+     "difference_cents": 133, "direction": "top_up_due"},
+    {"operator_id": "OC", "frozen_amount_cents": 167,
+     "paid_amount_cents": 167, "current_amount_cents": 301,
+     "difference_cents": 134, "direction": "top_up_due"},
+    {"operator_id": "OD", "frozen_amount_cents": 320,
+     "paid_amount_cents": 320, "current_amount_cents": 160,
+     "difference_cents": -160, "direction": "clawback_due"},
+    {"operator_id": "OE", "frozen_amount_cents": 160,
+     "paid_amount_cents": 160, "current_amount_cents": 80,
+     "difference_cents": -80, "direction": "clawback_due"}
+  ],
+  "created_at": "2026-10-11T09:00:00Z"
+}
+```
+
 ### `POST /event-quality/scans` — 刷卡事件质量扫描
 
 调用方提交扫描号 `scan_id`、UTC 半开区间 `[window_start, window_end)`（作用于事件的 `occurred_at`）、可选乘客白名单 `passengers`、**重复刷卡时间窗** `duplicate_window_seconds`（秒）以及**站点间最短行程秒数映射** `min_travel_seconds`（有向，形如 `{"出站站": {"进站站": 秒数}}`）。服务只读取 `events`，对区间内事件按乘客分组、按 `(occurred_at, seq)` 排序，逐条与该乘客的**上一条事件**比对，识别两类告警：
@@ -1027,9 +1157,9 @@ curl http://localhost:8000/disruption/replans/dr-2026-09-27-a
 - 对账批次创建成功 → `recon_batch_created`；
 - 网络校验首次提交成功（无论是否通过）→ `network_validated`；网络快照固化成功 → `network_snapshot_created`；
 - 争议创建成功（冻结收费快照）→ `dispute_opened`；争议结案成功（写入不可变退款流水）→ `dispute_resolved`；
-- 运营方清分首次关账或追补批次创建成功（批次 + 不可变流水同事务提交）→ `clearing_closed`；
+- 运营方清分首次关账或追补批次创建成功（批次 + 不可变流水同事务提交）→ `clearing_closed`；清分付款批次创建成功（付款快照 + 逐链覆盖 + 逐运营方明细同事务提交）→ `clearing_payout_created`；
 - 刷卡事件复核暂存创建成功（暂存 + 逐事件快照 + 事件标记 held + 重算同事务提交）→ `event_held`；暂存释放成功（释放结果只追加 + 事件解除 held + 重算同事务提交）→ `event_hold_released`；
-- **重复请求不产生审计记录**：事件幂等重复（`duplicate`）、批次幂等重复（`duplicate`）、网络校验 / 快照幂等重复、争议 / 结案幂等重复（`duplicate`）、清分首账 / 追补幂等重复（`duplicate`）、暂存 / 释放幂等重复（`duplicate`）、冲突（`409`）与校验失败（`422`）均不追加；
+- **重复请求不产生审计记录**：事件幂等重复（`duplicate`）、批次幂等重复（`duplicate`）、网络校验 / 快照幂等重复、争议 / 结案幂等重复（`duplicate`）、清分首账 / 追补 / 付款幂等重复（`duplicate`）、暂存 / 释放幂等重复（`duplicate`）、冲突（`409`）与校验失败（`422`）均不追加；
 - **只读分析不产生审计记录**：`POST /event-quality/scans` 只写其独立的只追加扫描表，`POST /privacy/exports` 只写其独立的只追加匿名导出表，`POST /disruption/replans` 只写其独立的只追加重排表；三者都不触碰 `audit_log`，也不改动事件、行程、账单或争议数据；`POST /events/correction-preview` 更正影响预览完全在内存中模拟，**不写任何表**，同样不追加审计记录；
 - 审计与业务数据同事务提交：业务写入（或审计写入）失败时一并回滚，不留半截记录。
 
@@ -1039,7 +1169,7 @@ curl http://localhost:8000/disruption/replans/dr-2026-09-27-a
 
 可选查询参数：
 
-- `operation`：按操作类型过滤（`event_processed` / `event_corrected` / `recon_batch_created` / `network_validated` / `network_snapshot_created` / `dispute_opened` / `dispute_resolved` / `clearing_closed` / `event_held` / `event_hold_released`）；
+- `operation`：按操作类型过滤（`event_processed` / `event_corrected` / `recon_batch_created` / `network_validated` / `network_snapshot_created` / `dispute_opened` / `dispute_resolved` / `clearing_closed` / `clearing_payout_created` / `event_held` / `event_hold_released`）；
 - `after`：只返回 `seq > after` 的记录（分页游标，默认 0）；
 - `limit`：每页条数（默认 100，最大 1000）。
 

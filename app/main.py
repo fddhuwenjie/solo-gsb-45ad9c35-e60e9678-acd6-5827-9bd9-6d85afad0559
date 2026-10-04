@@ -92,6 +92,12 @@ from .models import (
     NetworkValidateIn,
     NetworkValidateOut,
     PassengerPreview,
+    PayoutChainOut,
+    PayoutEntryOut,
+    PayoutIn,
+    PayoutOperatorTotal,
+    PayoutOut,
+    PayoutStatusOut,
     PendingEvent,
     PeriodTotal,
     PreviewTrip,
@@ -110,6 +116,15 @@ from .models import (
     TripOut,
 )
 from .network import NetEdge, validate_network
+from .payouts import (
+    PayoutError,
+    build_payout_plan,
+    canonical_payout_payload,
+    load_payout,
+    payload_hash as payout_payload_hash,
+    payout_response,
+    payout_status,
+)
 from .privacy import (
     UnmappedStationsError,
     build_export,
@@ -1832,6 +1847,185 @@ def get_clearing(
 
 
 # ---------------------------------------------------------------------------
+# Clearing payout batches (清分付款批次)
+# ---------------------------------------------------------------------------
+
+
+def _payout_out(body_dict: dict) -> PayoutOut:
+    return PayoutOut(
+        payout_id=body_dict["payout_id"],
+        status=body_dict["status"],
+        external_payment_ref=body_dict["external_payment_ref"],
+        chain_count=body_dict["chain_count"],
+        entry_count=body_dict["entry_count"],
+        net_amount_cents=body_dict["net_amount_cents"],
+        chains=[PayoutChainOut(**c) for c in body_dict["chains"]],
+        operator_totals=[
+            PayoutOperatorTotal(**o) for o in body_dict["operator_totals"]
+        ],
+        entries=[PayoutEntryOut(**e) for e in body_dict["entries"]],
+        created_at=body_dict["created_at"],
+    )
+
+
+def _load_payout_out(db: Database, payout_id: str, status: str) -> PayoutOut:
+    row = load_payout(db.conn, payout_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"payout '{payout_id}' not found")
+    stored = json.loads(row["result"])
+    stored["status"] = status  # the stored body always carries "created"
+    return _payout_out(stored)
+
+
+@app.post("/clearings/payouts", response_model=PayoutOut, status_code=200)
+def create_clearing_payout(
+    body: PayoutIn,
+    db: Database = Depends(get_db),
+) -> PayoutOut:
+    """Settle the new ledger rows of one or more clearing chains. In a single
+    transaction the service verifies every referenced first closing exists,
+    that expected_seq is the chain's current latest batch, that no covered
+    clearing batch was already taken by another payout and that the
+    caller-supplied per-operator net amounts equal the ledger exactly; it then
+    freezes the immutable payout snapshot with per-chain and per-operator
+    detail. Same payout_id + same payload replays idempotently; a different
+    payload returns 409."""
+    roots = [c.root_clearing_id for c in body.chains]
+    if len(set(roots)) != len(roots):
+        raise HTTPException(
+            status_code=422, detail="duplicate root_clearing_id in chains"
+        )
+    operators = [o.operator_id for o in body.operator_net_amounts]
+    if len(set(operators)) != len(operators):
+        raise HTTPException(
+            status_code=422, detail="duplicate operator_id in operator_net_amounts"
+        )
+
+    canonical_payload = canonical_payout_payload(body)
+    p_hash = payout_payload_hash(canonical_payload)
+
+    with db.lock(), db.conn:
+        existing = db.conn.execute(
+            "SELECT payload_hash FROM payouts WHERE payout_id = ?", (body.payout_id,)
+        ).fetchone()
+        if existing is not None:
+            if existing["payload_hash"] != p_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"payout_id '{body.payout_id}' already exists with a"
+                        " different payload"
+                    ),
+                )
+            # Idempotent replay: the frozen payment snapshot is never
+            # recomputed and no clearing batch is marked paid twice.
+            return _load_payout_out(db, body.payout_id, "duplicate")
+
+        try:
+            plan = build_payout_plan(db.conn, body)
+        except PayoutError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+        created_at = iso_str(datetime.now(timezone.utc))
+        response_body = payout_response(
+            payout_id=body.payout_id,
+            external_payment_ref=body.external_payment_ref,
+            plan=plan,
+            status="created",
+            created_at=created_at,
+        )
+
+        # Payout row, per-chain coverage, per-operator snapshot rows and the
+        # audit record all commit together: a failed write rolls everything
+        # back, so a rejected payout never advances a chain's paid watermark.
+        db.conn.execute(
+            "INSERT INTO payouts (payout_id, payload_hash, external_payment_ref,"
+            " chain_count, entry_count, net_amount_cents, result, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (
+                body.payout_id,
+                p_hash,
+                body.external_payment_ref,
+                response_body["chain_count"],
+                response_body["entry_count"],
+                response_body["net_amount_cents"],
+                canonical_json(response_body),
+                created_at,
+            ),
+        )
+        db.conn.executemany(
+            "INSERT INTO payout_chains (payout_id, seq, root_clearing_id,"
+            " expected_seq, last_paid_seq, entry_count, net_amount_cents)"
+            " VALUES (?,?,?,?,?,?,?)",
+            [
+                (
+                    body.payout_id,
+                    c["seq"],
+                    c["root_clearing_id"],
+                    c["expected_seq"],
+                    c["last_paid_seq"],
+                    c["entry_count"],
+                    c["net_amount_cents"],
+                )
+                for c in response_body["chains"]
+            ],
+        )
+        db.conn.executemany(
+            "INSERT INTO payout_entries (payout_id, seq, root_clearing_id,"
+            " clearing_id, clearing_seq, kind, trip_id, passenger_id,"
+            " from_station, to_station, ended_at, operator_id, amount_cents)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                (
+                    body.payout_id,
+                    e["seq"],
+                    e["root_clearing_id"],
+                    e["clearing_id"],
+                    e["clearing_seq"],
+                    e["kind"],
+                    e["trip_id"],
+                    e["passenger_id"],
+                    e["from_station"],
+                    e["to_station"],
+                    e["ended_at"],
+                    e["operator_id"],
+                    e["amount_cents"],
+                )
+                for e in response_body["entries"]
+            ],
+        )
+        response = _payout_out(response_body)
+        append_audit(
+            db.conn,
+            "clearing_payout_created",
+            canonical_payload,
+            response.model_dump(),
+        )
+
+    return response
+
+
+@app.get("/clearings/payouts/{payout_id}", response_model=PayoutStatusOut)
+def get_clearing_payout(
+    payout_id: str,
+    db: Database = Depends(get_db),
+) -> PayoutStatusOut:
+    """Payout status. The frozen snapshot (external reference, covered chains
+    and per-operator paid amounts) is returned as created; the top-up/clawback
+    balances are recomputed live from the current clearing ledger, so clearing
+    adjustments appended after the payout surface here without ever rewriting
+    the paid snapshot."""
+    with db.lock():
+        row = load_payout(db.conn, payout_id)
+        if row is None:
+            raise HTTPException(
+                status_code=404, detail=f"payout '{payout_id}' not found"
+            )
+        status = payout_status(db.conn, row)
+    return PayoutStatusOut(**status)
+
+
+# ---------------------------------------------------------------------------
 # Tap-event quality scans (read-only analysis, isolated append-only tables)
 # ---------------------------------------------------------------------------
 
@@ -2277,6 +2471,7 @@ def list_audit(
         pattern="^(event_processed|event_corrected|recon_batch_created"
                 "|network_validated|network_snapshot_created"
                 "|dispute_opened|dispute_resolved|clearing_closed"
+                "|clearing_payout_created"
                 "|event_held|event_hold_released)$",
         description="Filter by operation type",
     ),

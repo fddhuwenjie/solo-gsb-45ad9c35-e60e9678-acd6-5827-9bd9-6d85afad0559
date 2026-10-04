@@ -359,6 +359,100 @@ BEGIN
     SELECT RAISE(ABORT, 'clearing_entries is an immutable ledger: DELETE is not allowed');
 END;
 
+-- Clearing payout batches (清分付款批次). A payout tells the payment system
+-- which immutable clearing ledger rows have actually been settled to
+-- operators. For every referenced first closing (payout_chains) it covers the
+-- clearing batches strictly after the chain's previous payout watermark up to
+-- and including expected_seq; the covered ledger rows are copied verbatim into
+-- payout_entries as the immutable payment snapshot. All three tables are
+-- append-only: later clearing adjustments append new clearing_entries rows but
+-- can never rewrite or delete rows a payout covered, and a payout itself can
+-- never be mutated.
+CREATE TABLE IF NOT EXISTS payouts (
+    payout_id              TEXT PRIMARY KEY,
+    payload_hash           TEXT NOT NULL,     -- sha256 of the canonical request
+    external_payment_ref   TEXT NOT NULL,     -- caller-side payment reference
+    chain_count            INTEGER NOT NULL,
+    entry_count            INTEGER NOT NULL,
+    net_amount_cents       INTEGER NOT NULL,  -- signed total frozen by this payout
+    result                 TEXT NOT NULL,     -- JSON: the exact API response
+    created_at             TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS payout_chains (
+    payout_id          TEXT NOT NULL REFERENCES payouts(payout_id),
+    seq                INTEGER NOT NULL,      -- 0-based position inside the payout
+    root_clearing_id   TEXT NOT NULL,         -- the chain's first closing (clearing_batches seq 0)
+    expected_seq       INTEGER NOT NULL,      -- latest clearing batch seq covered
+    last_paid_seq      INTEGER NOT NULL,      -- previous payout watermark (-1 = never paid)
+    entry_count        INTEGER NOT NULL,
+    net_amount_cents   INTEGER NOT NULL,      -- signed net paid out on this chain
+    PRIMARY KEY (payout_id, seq),
+    UNIQUE (payout_id, root_clearing_id)
+);
+-- A clearing chain is at most once per payout and its covered seq ranges are
+-- checked transactionally against this table; the root column is indexed for
+-- the watermark lookups.
+CREATE INDEX IF NOT EXISTS idx_payout_chains_root
+    ON payout_chains (root_clearing_id);
+
+CREATE TABLE IF NOT EXISTS payout_entries (
+    payout_id          TEXT NOT NULL REFERENCES payouts(payout_id),
+    seq                INTEGER NOT NULL,      -- 0-based global entry number inside the payout
+    root_clearing_id   TEXT NOT NULL,
+    clearing_id        TEXT NOT NULL,
+    clearing_seq       INTEGER NOT NULL,      -- the covered clearing batch's chain seq
+    kind               TEXT NOT NULL CHECK (kind IN ('initial', 'adjustment')),
+    trip_id            TEXT NOT NULL,
+    passenger_id       TEXT NOT NULL,
+    from_station       TEXT NOT NULL,
+    to_station         TEXT NOT NULL,
+    ended_at           TEXT NOT NULL,
+    operator_id        TEXT NOT NULL,
+    amount_cents       INTEGER NOT NULL,      -- signed snapshot copy of the clearing row
+    PRIMARY KEY (payout_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_payout_entries_chain
+    ON payout_entries (root_clearing_id, clearing_seq);
+CREATE INDEX IF NOT EXISTS idx_payout_entries_operator
+    ON payout_entries (root_clearing_id, operator_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_payouts_no_update
+BEFORE UPDATE ON payouts
+BEGIN
+    SELECT RAISE(ABORT, 'payouts is append-only: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_payouts_no_delete
+BEFORE DELETE ON payouts
+BEGIN
+    SELECT RAISE(ABORT, 'payouts is append-only: DELETE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_payout_chains_no_update
+BEFORE UPDATE ON payout_chains
+BEGIN
+    SELECT RAISE(ABORT, 'payout_chains is append-only: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_payout_chains_no_delete
+BEFORE DELETE ON payout_chains
+BEGIN
+    SELECT RAISE(ABORT, 'payout_chains is append-only: DELETE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_payout_entries_no_update
+BEFORE UPDATE ON payout_entries
+BEGIN
+    SELECT RAISE(ABORT, 'payout_entries is an immutable snapshot: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_payout_entries_no_delete
+BEFORE DELETE ON payout_entries
+BEGIN
+    SELECT RAISE(ABORT, 'payout_entries is an immutable snapshot: DELETE is not allowed');
+END;
+
 -- Tap-event quality scans. These tables are deliberately isolated from the
 -- settlement domain: a scan only ever reads events and appends its own rows.
 -- Events, trips, trip_charges, disputes and the audit_log are never touched by
@@ -516,7 +610,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
                           'recon_batch_created', 'network_validated',
                           'network_snapshot_created',
                           'dispute_opened', 'dispute_resolved',
-                          'clearing_closed',
+                          'clearing_closed', 'clearing_payout_created',
                           'event_held', 'event_hold_released')),
     occurred_at      TEXT NOT NULL,         -- ISO-8601, normalised to UTC
     request_summary  TEXT NOT NULL,         -- canonical JSON of the normalised request
@@ -546,6 +640,7 @@ _AUDIT_OPERATIONS = (
     "event_processed", "event_corrected", "recon_batch_created",
     "network_validated", "network_snapshot_created",
     "dispute_opened", "dispute_resolved", "clearing_closed",
+    "clearing_payout_created",
     "event_held", "event_hold_released",
 )
 
@@ -560,7 +655,7 @@ CREATE TABLE audit_log (
                           'recon_batch_created', 'network_validated',
                           'network_snapshot_created',
                           'dispute_opened', 'dispute_resolved',
-                          'clearing_closed',
+                          'clearing_closed', 'clearing_payout_created',
                           'event_held', 'event_hold_released')),
     occurred_at      TEXT NOT NULL,
     request_summary  TEXT NOT NULL,
